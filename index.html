@@ -68,6 +68,14 @@ canvas.crop{max-width:100%;height:auto;touch-action:none;border:1px dashed var(-
 </div>
 <label>Opacity<input type="range" id="wmOp" min="5" max="80" value="30"></label>
 <label>Size<input type="range" id="wmSz" min="3" max="20" value="7"></label>
+
+<h3 style="margin:14px 0 8px">Image colour</h3>
+<label>Mode<select id="gray">
+  <option value="color">Color — keep original</option>
+  <option value="gray">Grayscale</option>
+  <option value="grayHC">Grayscale — high contrast</option>
+</select></label>
+
 <div class="row"><button id="pdf">Export PDF</button></div>
 <canvas id="prev" width="630" height="891"></canvas>
 </aside></main>
@@ -79,7 +87,7 @@ canvas.crop{max-width:100%;height:auto;touch-action:none;border:1px dashed var(-
    Workflow:
      load (gallery or camera) → purple rigid rectangle guide
      → user places it → Auto-detect → blue result quad
-     → user fine-tunes → perspective warp → PDF
+     → user fine-tunes → perspective warp → (optional grayscale) → PDF
    Detection:
      Signed ∇I · n, outside→inside scan, cross-side sign vote.
    ===================================================================== */
@@ -95,6 +103,17 @@ const CARD_W = 85.6;
 const MAX_DIM = 2400;
 const CROP_MAX = 1200;
 const CROP_DRAG = 560;
+
+/* ---------------- watermark text style (single place to edit) --------
+   Font stack: plain system sans-serif (Helvetica/Arial fallback).
+   Weight:     'normal' — set to 'bold' if you want thicker text.
+   Colour:     plain black. No outline/halo is drawn any more.
+   Size:       em size = card width on the page × (Size slider / 100).
+   -------------------------------------------------------------------- */
+const WM_FONT_STACK = 'Helvetica, Arial, sans-serif';
+const WM_WEIGHT     = 'normal';
+const WM_COLOR      = '#000';
+const wmFont = px => `${WM_WEIGHT} ${px}px ${WM_FONT_STACK}`;
 
 let QUALITY = CROP_MAX;
 
@@ -197,6 +216,33 @@ function toGray(canvas){
     g[i] = (d[p]*77 + d[p+1]*150 + d[p+2]*29) >> 8;
   return g;
 }
+
+/* ---------- colour → grayscale (optional contrast boost) ------------ */
+function toGrayscale(srcCanvas, contrast){
+  const w = srcCanvas.width, h = srcCanvas.height;
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const x = c.getContext('2d', {willReadFrequently:true});
+  x.drawImage(srcCanvas, 0, 0);
+
+  const id = x.getImageData(0, 0, w, h);
+  const d  = id.data;
+  const k  = contrast || 1;
+
+  /* lookup table: luminance index → output value (clamped automatically) */
+  const lut = new Uint8ClampedArray(256);
+  for (let v = 0; v < 256; v++) lut[v] = (k === 1) ? v : (v - 128) * k + 128;
+
+  for (let i = 0; i < d.length; i += 4){
+    const g = (d[i]*77 + d[i+1]*150 + d[i+2]*29) >> 8;
+    const v = lut[g];
+    d[i] = d[i+1] = d[i+2] = v;
+  }
+  x.putImageData(id, 0, 0);
+  return c;
+}
+
+const colorMode = () => ($('gray') ? $('gray').value : 'color');
 
 function boxBlur(src, w, h, r){
   const tmp = new Uint8ClampedArray(w*h), out = new Uint8ClampedArray(w*h);
@@ -517,7 +563,7 @@ function Slot(label){
   const cv  = el.querySelector('canvas');
   const ctx = cv.getContext('2d');
 
-  const S = {img:null, draft:null, result:null, s:1, _dirty:true, _cache:null, _cacheQ:0};
+  const S = {img:null, draft:null, result:null, s:1, _dirty:true, _cache:null, _cacheQ:0, _cacheMode:null};
 
   const PURPLE = '#a855f7';
   const BLUE   = '#2a6df4';
@@ -808,12 +854,22 @@ function Slot(label){
     if (!S.img) return null;
     const q = activeQuad();
     if (!q) return null;
-    if (S._cache && !S._dirty && S._cacheQ === QUALITY) return S._cache;
-    const c = warpQuad(S.img, q, QUALITY);
+
+    const mode = colorMode();
+    if (S._cache && !S._dirty && S._cacheQ === QUALITY && S._cacheMode === mode)
+      return S._cache;
+
+    let c = warpQuad(S.img, q, QUALITY);
     if (!c) return S._cache;
-    S._cache  = c;
-    S._cacheQ = QUALITY;
-    S._dirty  = false;
+
+    /* optional grayscale conversion (kept in the cache, so both the
+       preview and the PDF export use the same processed pixels) */
+    if (mode !== 'color') c = toGrayscale(c, mode === 'grayHC' ? 1.45 : 1);
+
+    S._cache     = c;
+    S._cacheQ    = QUALITY;
+    S._cacheMode = mode;
+    S._dirty     = false;
     return c;
   };
 
@@ -916,7 +972,13 @@ function layout(){
   return out;
 }
 
-/* ================= watermark: per-card modes ========================== */
+/* ================= watermark: per-card modes ==========================
+   Text style comes from the WM_* constants at the top of the script:
+     font  : WM_WEIGHT + size + WM_FONT_STACK (plain sans-serif)
+     colour: WM_COLOR (plain black), no outline stroke
+     size  : em size = card width on page × (Size slider / 100)
+     alpha : Opacity slider / 100
+   ===================================================================== */
 function drawCardWatermark(x, it, k){
   if (!$('wmOn').checked) return;
   const pos = $('wmPos').value;
@@ -930,11 +992,10 @@ function drawCardWatermark(x, it, k){
   x.save();
   x.beginPath(); x.rect(px,py,pw,ph); x.clip();
   x.globalAlpha = $('wmOp').value/100;
-  x.fillStyle = '#888'; x.strokeStyle = '#fff';
-  x.lineWidth = Math.max(1, fs/14);
-  x.font = `bold ${fs}px sans-serif`;
+  x.fillStyle = WM_COLOR;
+  x.font = wmFont(fs);
   x.textBaseline = 'middle';
-  const put = (tx,ty,al) => { x.textAlign = al; x.strokeText(t,tx,ty); x.fillText(t,tx,ty); };
+  const put = (tx,ty,al) => { x.textAlign = al; x.fillText(t,tx,ty); };
 
   if (pos === 'tile'){
     x.translate(px+pw/2, py+ph/2);
@@ -965,9 +1026,8 @@ function drawCustomWatermark(x, k){
   const fs = CARD_W * ($('wmSz').value/100) * k;
   x.save();
   x.globalAlpha = $('wmOp').value/100;
-  x.fillStyle = '#888'; x.strokeStyle = '#fff';
-  x.lineWidth = Math.max(1, fs/14);
-  x.font = `bold ${fs}px sans-serif`;
+  x.fillStyle = WM_COLOR;
+  x.font = wmFont(fs);
   x.textBaseline = 'middle';
   x.textAlign = 'center';
   for (const t of customTexts){
@@ -975,7 +1035,6 @@ function drawCustomWatermark(x, k){
     x.save();
     x.translate(t.x*k, t.y*k);
     x.rotate(t.rot*Math.PI/180);
-    x.strokeText(t.text, 0, 0);
     x.fillText(t.text, 0, 0);
     x.restore();
   }
@@ -1025,7 +1084,7 @@ function hitTest(cx, cy){
 
   const x = prev.getContext('2d');
   x.save();
-  x.font = `bold ${fs}px sans-serif`;
+  x.font = wmFont(fs);          /* same font as the drawing code */
   const hPad = fs*0.65;
   for (let i=customTexts.length-1;i>=0;i--){
     const t = customTexts[i];
@@ -1097,6 +1156,10 @@ $('gap').addEventListener('input', () => {
   $(id).addEventListener('input', update);
   $(id).addEventListener('change', update);
 });
+/* grayscale / colour mode — the crop cache is keyed by mode, so a plain
+   re-render is enough; no need to invalidate anything by hand. */
+$('gray').addEventListener('change', update);
+
 $('wmPos').addEventListener('change', () => {
   const isCustom = $('wmPos').value === 'custom';
   $('customWrap').style.display  = isCustom ? '' : 'none';
