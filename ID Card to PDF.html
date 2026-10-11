@@ -1,0 +1,1152 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>ID Card to PDF</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--bg:#f6f6f4;--card:#fff;--tx:#1d1d1b;--mut:#6b6b66;--ac:#2a6df4;--bd:#d9d9d4}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#17181a;--card:#222426;--tx:#eee;--mut:#9a9a95;--ac:#6b9bff;--bd:#3a3c3f}}
+:root[data-theme="dark"]{--bg:#17181a;--card:#222426;--tx:#eee;--mut:#9a9a95;--ac:#6b9bff;--bd:#3a3c3f}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:1100px;margin:0 auto;padding:16px;display:grid;gap:16px;grid-template-columns:1fr}
+@media(min-width:860px){main{grid-template-columns:minmax(0,1fr) 340px}}
+section,aside{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px;margin-bottom:12px}
+h1{font-size:20px;margin:0 0 4px}h3{margin:0 0 8px;font-size:15px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
+button{background:var(--ac);color:#fff;border:0;border-radius:6px;padding:7px 12px;font:inherit;cursor:pointer}
+button.alt{background:transparent;color:var(--tx);border:1px solid var(--bd)}
+input[type=text],select{padding:6px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:var(--tx);font:inherit;max-width:100%}
+input[type=range]{width:100%;accent-color:var(--ac)}
+label{display:flex;flex-direction:column;gap:2px;font-size:13px;color:var(--mut);margin-bottom:8px}
+canvas.crop{max-width:100%;height:auto;touch-action:none;border:1px dashed var(--bd);border-radius:6px;display:block;cursor:default}
+#prev{width:100%;height:auto;background:#fff;border:1px solid var(--bd);display:block;touch-action:none;user-select:none;-webkit-user-select:none}
+.mut{color:var(--mut);font-size:13px}
+.wmRow{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:6px;margin-bottom:6px;align-items:center}
+.wmRow input,.wmRow select{min-width:0;padding:5px 6px;font-size:13px}
+.wmRow button{padding:4px 9px;line-height:1;font-size:15px}
+</style></head><body><main>
+<div>
+<h1>ID card → PDF</h1>
+<p class="mut">Everything runs in your browser — images are never uploaded. Place the purple guide over your ID, press Auto-detect to snap it, then fine-tune the blue result. Cards print at real ID‑1 size (85.6&nbsp;mm wide) and are centred on the page.</p>
+<div id="slots"></div>
+</div>
+<aside>
+<h3>Layout &amp; watermark</h3>
+<label>Paper size<select id="page">
+  <option value="a4">A4 — 210 × 297 mm</option>
+  <option value="a3">A3 — 297 × 420 mm</option>
+  <option value="a5">A5 — 148 × 210 mm</option>
+  <option value="letter">Letter — 216 × 279 mm</option>
+</select></label>
+<label><span>Gap between cards — <span id="gapv">8</span> mm</span>
+  <input type="range" id="gap" min="0" max="297" step="0.5" value="8">
+</label>
+<label><span><input type="checkbox" id="wmOn" checked> Watermark</span></label>
+<label id="wmTextWrap">Text<input type="text" id="wmText" value="For verification only"></label>
+<label>Position<select id="wmPos">
+  <option value="tile">Diagonal tiled</option>
+  <option value="custom">Custom (drag on preview)</option>
+  <option value="center">Center</option>
+  <option value="bl">Bottom left</option>
+  <option value="br">Bottom right</option>
+  <option value="top">Top</option>
+</select></label>
+<div id="customWrap" style="display:none">
+  <div class="row"><button id="addWm" class="alt" type="button">+ Add text</button></div>
+  <div id="wmList"></div>
+  <p class="mut" style="font-size:12px;margin:4px 0 8px">Drag any text on the preview to reposition. Use the dropdown to change its rotation.</p>
+</div>
+<label>Opacity<input type="range" id="wmOp" min="5" max="80" value="30"></label>
+<label>Size<input type="range" id="wmSz" min="3" max="20" value="7"></label>
+<div class="row"><button id="pdf">Export PDF</button></div>
+<canvas id="prev" width="630" height="891"></canvas>
+</aside></main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+/* =====================================================================
+   ID card → PDF
+   ---------------------------------------------------------------------
+   Workflow:
+     load → purple rigid rectangle guide → user places it → Auto-detect
+          → blue result quad → user fine-tunes → perspective warp → PDF
+   Detection:
+     For each side of the purple rectangle, fire short perpendicular scan
+     lines (10% end-offsets to avoid corner/neighbour edges), find the
+     strongest gradient on each, fit a robust line, intersect adjacent
+     lines → new quad.
+   ===================================================================== */
+
+const $ = id => document.getElementById(id);
+const clamp = (v,a,b) => v<a?a:(v>b?b:v);
+const clampI = (v,a,b) => v<a?a:(v>b?b:v);
+const fmt = v => String(Math.round(v*10)/10);
+const dist = (a,b) => Math.hypot(a.x-b.x, a.y-b.y);
+
+const PAGE = {a4:[210,297], a3:[297,420], a5:[148,210], letter:[215.9,279.4]};
+const CARD_W = 85.6;
+const MAX_DIM = 2400;
+const CROP_MAX = 1200;
+const CROP_DRAG = 560;
+
+let QUALITY = CROP_MAX;
+
+const slots = [];
+
+let rafId = 0;
+function update(){
+  if (rafId) return;
+  rafId = requestAnimationFrame(()=>{ rafId = 0; render(); });
+}
+
+/* ============================== geometry ============================== */
+
+function orderQuad(pts){
+  const cx = (pts[0].x+pts[1].x+pts[2].x+pts[3].x)/4;
+  const cy = (pts[0].y+pts[1].y+pts[2].y+pts[3].y)/4;
+  const arr = pts.map(p => ({p, a: Math.atan2(p.y-cy, p.x-cx)}))
+                 .sort((u,v)=>u.a-v.a).map(o=>o.p);
+  let bi = 0, best = Infinity;
+  arr.forEach((p,i)=>{ const d = p.x+p.y; if (d < best){ best = d; bi = i; } });
+  const out = [arr[bi], arr[(bi+1)%4], arr[(bi+2)%4], arr[(bi+3)%4]];
+  const cr = (out[1].x-out[0].x)*(out[2].y-out[1].y) - (out[1].y-out[0].y)*(out[2].x-out[1].x);
+  return cr < 0 ? [out[0], out[3], out[2], out[1]] : out;
+}
+
+function unitSquareToQuad(q){
+  const [p0,p1,p2,p3] = q;
+  const dx1 = p1.x-p2.x, dx2 = p3.x-p2.x, dx3 = p0.x-p1.x+p2.x-p3.x;
+  const dy1 = p1.y-p2.y, dy2 = p3.y-p2.y, dy3 = p0.y-p1.y+p2.y-p3.y;
+  let a,b,c,d,e,f,g,h;
+  if (Math.abs(dx3) < 1e-9 && Math.abs(dy3) < 1e-9){
+    a = p1.x-p0.x; b = p2.x-p1.x; c = p0.x;
+    d = p1.y-p0.y; e = p2.y-p1.y; f = p0.y;
+    g = 0; h = 0;
+  } else {
+    const den = dx1*dy2 - dx2*dy1;
+    g = (dx3*dy2 - dx2*dy3)/den;
+    h = (dx1*dy3 - dx3*dy1)/den;
+    a = p1.x-p0.x + g*p1.x;
+    b = p3.x-p0.x + h*p3.x;
+    c = p0.x;
+    d = p1.y-p0.y + g*p1.y;
+    e = p3.y-p0.y + h*p3.y;
+    f = p0.y;
+  }
+  return [a,b,c,d,e,f,g,h];
+}
+
+function quadArea(q){
+  let s = 0;
+  for (let i=0;i<4;i++){ const p=q[i], r=q[(i+1)%4]; s += p.x*r.y - r.x*p.y; }
+  return Math.abs(s)/2;
+}
+
+function pointInQuad(p, q){
+  let pos = 0, neg = 0;
+  for (let i=0;i<4;i++){
+    const a = q[i], b = q[(i+1)%4];
+    const cr = (b.x-a.x)*(p.y-a.y) - (b.y-a.y)*(p.x-a.x);
+    if (cr > 0) pos++; else if (cr < 0) neg++;
+  }
+  return pos === 0 || neg === 0;
+}
+
+function isConvexQuad(q){
+  let sign = 0;
+  for (let i=0;i<4;i++){
+    const a = q[(i+3)%4], b = q[i], c = q[(i+1)%4];
+    const cr = (b.x-a.x)*(c.y-b.y) - (b.y-a.y)*(c.x-b.x);
+    if (Math.abs(cr) < 1e-6) continue;
+    const s = cr > 0 ? 1 : -1;
+    if (sign === 0) sign = s; else if (s !== sign) return false;
+  }
+  return sign !== 0;
+}
+
+/* ========================= image processing =========================== */
+
+function toCanvas(src, maxDim){
+  const iw = src.naturalWidth || src.width;
+  const ih = src.naturalHeight || src.height;
+  const k = maxDim ? Math.min(1, maxDim/Math.max(iw,ih)) : 1;
+  const c = document.createElement('canvas');
+  c.width  = Math.max(1, Math.round(iw*k));
+  c.height = Math.max(1, Math.round(ih*k));
+  c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+  return c;
+}
+
+function getPixels(canvas){
+  return canvas.getContext('2d', {willReadFrequently:true})
+               .getImageData(0,0,canvas.width,canvas.height).data;
+}
+
+function toGray(canvas){
+  const w = canvas.width, h = canvas.height;
+  const d = getPixels(canvas);
+  const g = new Uint8ClampedArray(w*h);
+  for (let i=0,p=0;i<g.length;i++,p+=4)
+    g[i] = (d[p]*77 + d[p+1]*150 + d[p+2]*29) >> 8;
+  return g;
+}
+
+function boxBlur(src, w, h, r){
+  const tmp = new Uint8ClampedArray(w*h), out = new Uint8ClampedArray(w*h);
+  const n = 2*r+1;
+  for (let y=0;y<h;y++){
+    const row = y*w;
+    let sum = 0;
+    for (let i=-r;i<=r;i++) sum += src[row + clampI(i,0,w-1)];
+    for (let x=0;x<w;x++){
+      tmp[row+x] = sum/n;
+      sum += src[row + clampI(x+r+1,0,w-1)] - src[row + clampI(x-r,0,w-1)];
+    }
+  }
+  for (let x=0;x<w;x++){
+    let sum = 0;
+    for (let i=-r;i<=r;i++) sum += tmp[clampI(i,0,h-1)*w + x];
+    for (let y=0;y<h;y++){
+      out[y*w+x] = sum/n;
+      sum += tmp[clampI(y+r+1,0,h-1)*w + x] - tmp[clampI(y-r,0,h-1)*w + x];
+    }
+  }
+  return out;
+}
+
+function sobelMag(g, w, h){
+  const m = new Float32Array(w*h);
+  for (let y=1;y<h-1;y++){
+    for (let x=1;x<w-1;x++){
+      const i = y*w+x;
+      const a=g[i-w-1], b=g[i-w], c=g[i-w+1];
+      const d=g[i-1],             e=g[i+1];
+      const f=g[i+w-1], gg=g[i+w], hh=g[i+w+1];
+      const gx = (c + 2*e + hh) - (a + 2*d + f);
+      const gy = (f + 2*gg + hh) - (a + 2*b + c);
+      m[i] = Math.sqrt(gx*gx + gy*gy);
+    }
+  }
+  return m;
+}
+
+/* ---------- line fitting ---------- */
+function fitLineTLS(pts){
+  let mx=0, my=0;
+  for (const p of pts){ mx += p.x; my += p.y; }
+  mx /= pts.length; my /= pts.length;
+  let sxx=0, sxy=0, syy=0;
+  for (const p of pts){
+    const ux = p.x-mx, uy = p.y-my;
+    sxx += ux*ux; sxy += ux*uy; syy += uy*uy;
+  }
+  const th = 0.5*Math.atan2(2*sxy, sxx-syy);
+  return {px:mx, py:my, dx:Math.cos(th), dy:Math.sin(th)};
+}
+
+function fitLineRobust(pts){
+  let use = pts.slice(), line = null;
+  for (let k=0;k<3;k++){
+    if (use.length < 4) return null;
+    line = fitLineTLS(use);
+    const res = use.map(p => Math.abs((p.x-line.px)*(-line.dy) + (p.y-line.py)*line.dx));
+    const sorted = res.slice().sort((a,b)=>a-b);
+    const med = sorted[sorted.length>>1];
+    const cutoff = Math.max(0.6, med*2.5);
+    const filtered = use.filter((p,i) => res[i] <= cutoff);
+    if (filtered.length === use.length) break;
+    use = filtered;
+  }
+  return line;
+}
+
+function intersectLines(l1, l2){
+  const den = l1.dx*l2.dy - l1.dy*l2.dx;
+  if (Math.abs(den) < 1e-9) return null;
+  const t = ((l2.px-l1.px)*l2.dy - (l2.py-l1.py)*l2.dx) / den;
+  return {x: l1.px + t*l1.dx, y: l1.py + t*l1.dy};
+}
+
+/* ---------------------------------------------------------------------
+   snapQuadToEdges — guided edge snapping with signed-gradient voting.
+
+   For each side of the draft quad:
+     • Lay down `samples` scan lines perpendicular to the side,
+       skipping `skipFrac` at both ends to avoid the adjacent edges.
+     • Each scan line is centred on the draft edge and spans
+       ±halfLen (half outside, half inside the draft).
+     • Traverse from OUTSIDE → INSIDE (o: +halfLen → −halfLen).
+     • On each scan line, keep two peaks:
+         plus  : strongest positive D = ∇I · n (card darker than bg)
+         minus : strongest negative D         (card brighter than bg)
+       where n is the outward-pointing unit normal.
+   Then:
+     • Each side votes for plus/minus by its average peak strength.
+     • Majority sign wins (cross-side vote).
+     • Each side's line is fitted to peaks of the winning sign
+       (with a per-side fallback to the other sign if too few).
+     • Intersect adjacent lines → 4 corners.
+   --------------------------------------------------------------------- */
+function snapQuadToEdges(srcCanvas, draftQuad, opts){
+  opts = opts || {};
+  /*
+    If detection is too conservative (bails with an alert),
+    raise searchR to ~0.05 and lower minEdge to 2.
+    If it's grabbing the wrong edge (jumping to internal text),
+    lower searchR to ~0.025 and raise minEdge to 5.
+  */
+  const samples   = opts.samples   || 32;
+  const skipFrac  = opts.skipFrac  || 0.10;   // 10% offset at each end
+  const searchR   = opts.searchR   || 0.025;  // half-length as frac of side
+  const minPoints = opts.minPoints || 6;
+  const maxDim    = opts.maxDim    || 1024;
+  const minEdge   = opts.minEdge   || 2.0;    // gradient floor per peak
+
+  const W0 = srcCanvas.width, H0 = srcCanvas.height;
+  const sc = Math.min(1, maxDim/Math.max(W0,H0));
+
+  let work = srcCanvas;
+  if (sc < 1){
+    work = document.createElement('canvas');
+    work.width  = Math.max(32, Math.round(W0*sc));
+    work.height = Math.max(32, Math.round(H0*sc));
+    work.getContext('2d').drawImage(srcCanvas, 0, 0, work.width, work.height);
+  }
+  const W = work.width, H = work.height;
+
+  const gray = toGray(work);
+  const blur = boxBlur(boxBlur(gray, W, H, 1), W, H, 1);
+
+  // Draft quad in working coords, ordered TL,TR,BR,BL.
+  // With this winding, n = (uy, -ux) points OUTWARD on every side.
+  const quad = orderQuad(draftQuad.map(p => ({x: p.x*sc, y: p.y*sc})));
+
+  // sideSamples[s] = [{ plus:{x,y,score}|null, minus:{x,y,score}|null }, ...]
+  const sideSamples = [];
+  const sideScore   = [];   // { plus:avg, minus:avg, nP, nM }
+
+  for (let s = 0; s < 4; s++){
+    const a = quad[s], b = quad[(s+1)%4];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const L  = Math.hypot(dx, dy);
+    if (L < 20) return null;
+
+    const ux = dx/L, uy = dy/L;
+    const nx = uy, ny = -ux;                // outward normal
+
+    const halfLen = Math.max(6, Math.min(60, L * searchR));
+    const steps   = Math.max(12, Math.round(halfLen * 2));
+
+    const arr = [];
+    let sumP = 0, sumM = 0, nP = 0, nM = 0;
+
+    for (let i = 0; i < samples; i++){
+      const t = skipFrac + ((i + 0.5) / samples) * (1 - 2*skipFrac);
+      const cx = a.x + dx * t;
+      const cy = a.y + dy * t;
+
+      // OUTSIDE → INSIDE: o runs from +halfLen down to −halfLen
+      let bestP = null, bestM = null;
+      for (let j = 0; j <= steps; j++){
+        const o = halfLen - (j / steps) * (2 * halfLen);
+        const ix = Math.round(cx + nx * o);
+        const iy = Math.round(cy + ny * o);
+        if (ix < 1 || iy < 1 || ix >= W-1 || iy >= H-1) continue;
+
+        // central-difference gradient of the blurred grey image
+        const gx = (blur[iy*W + ix + 1] - blur[iy*W + ix - 1]) * 0.5;
+        const gy = (blur[(iy+1)*W + ix] - blur[(iy-1)*W + ix]) * 0.5;
+
+        // signed directional derivative along the OUTWARD normal
+        const D = gx * nx + gy * ny;
+
+        if (D > 0){
+          if (!bestP || D > bestP.score) bestP = { o, score: D };
+        } else if (D < 0){
+          const aM = -D;
+          if (!bestM || aM > bestM.score) bestM = { o, score: aM };
+        }
+      }
+
+      if (bestP && bestP.score < minEdge) bestP = null;
+      if (bestM && bestM.score < minEdge) bestM = null;
+      if (!bestP && !bestM) continue;
+
+      const ep = bestP ? { x: cx + nx*bestP.o, y: cy + ny*bestP.o, score: bestP.score } : null;
+      const em = bestM ? { x: cx + nx*bestM.o, y: cy + ny*bestM.o, score: bestM.score } : null;
+      arr.push({ plus: ep, minus: em });
+
+      if (ep){ sumP += ep.score; nP++; }
+      if (em){ sumM += em.score; nM++; }
+    }
+
+    sideSamples.push(arr);
+    sideScore.push({
+      plus:  nP ? sumP / nP : 0,
+      minus: nM ? sumM / nM : 0,
+      nP, nM
+    });
+  }
+
+  // ---- cross-side vote ----
+  let votesPlus = 0, votesMinus = 0, marginPlus = 0, marginMinus = 0;
+  for (const s of sideScore){
+    if (!s.nP && !s.nM) continue;
+    if (!s.nP){ votesMinus++; marginMinus += s.minus; continue; }
+    if (!s.nM){ votesPlus++;  marginPlus  += s.plus;  continue; }
+    if (s.plus >= s.minus){ votesPlus++;  marginPlus  += s.plus  - s.minus; }
+    else                  { votesMinus++; marginMinus += s.minus - s.plus;  }
+  }
+
+  let winSign;
+  if (votesPlus > votesMinus)       winSign = 'plus';
+  else if (votesMinus > votesPlus)  winSign = 'minus';
+  else                              winSign = (marginPlus >= marginMinus) ? 'plus' : 'minus';
+
+  // ---- fit each side to the winning sign (with per-side fallback) ----
+  const other = winSign === 'plus' ? 'minus' : 'plus';
+  const lines = [];
+  for (let s = 0; s < 4; s++){
+    const arr = sideSamples[s];
+    let pts = [];
+    for (const e of arr) if (e[winSign]) pts.push({ x: e[winSign].x, y: e[winSign].y });
+    if (pts.length < minPoints){
+      pts = [];
+      for (const e of arr) if (e[other]) pts.push({ x: e[other].x, y: e[other].y });
+    }
+    if (pts.length < minPoints) return null;
+    const line = fitLineRobust(pts);
+    if (!line) return null;
+    lines.push(line);
+  }
+
+  // ---- intersect adjacent lines → corners ----
+  const corners = [];
+  for (let i = 0; i < 4; i++){
+    const p = intersectLines(lines[(i+3)%4], lines[i]);
+    if (!p) return null;
+    corners.push(p);
+  }
+
+  if (!isConvexQuad(corners)) return null;
+  if (quadArea(corners) < W*H*0.005) return null;
+
+  return corners.map(p => ({ x: p.x/sc, y: p.y/sc }));
+}
+
+/* ---------------------------------------------------------------------
+   warpQuad — perspective-correct a quad into a new canvas.
+   --------------------------------------------------------------------- */
+function warpQuad(srcCanvas, quad, maxDim){
+  const q  = orderQuad(quad);
+  const sw = srcCanvas.width, sh = srcCanvas.height;
+
+  const wT = dist(q[0],q[1]), wB = dist(q[3],q[2]);
+  const hL = dist(q[0],q[3]), hR = dist(q[1],q[2]);
+
+  let outW = Math.round((wT+wB)/2);
+  let outH = Math.round((hL+hR)/2);
+  if (outW < 8 || outH < 8) return null;
+  const long = Math.max(outW, outH);
+  if (long > maxDim){
+    const k = maxDim/long;
+    outW = Math.max(8, Math.round(outW*k));
+    outH = Math.max(8, Math.round(outH*k));
+  }
+
+  const [a,b,c,d,e,f,g,h] = unitSquareToQuad(q);
+  const A  = a/outW, B  = b/outH, C = c;
+  const D  = d/outW, E  = e/outH, F = f;
+  const G  = g/outW, Hh = h/outH;
+
+  const sd = getPixels(srcCanvas);
+  const out = new ImageData(outW, outH);
+  const od  = out.data;
+  const maxX = sw - 1, maxY = sh - 1;
+
+  for (let Y=0; Y<outH; Y++){
+    const yBase = Hh*Y + 1;
+    const rowOut = Y*outW;
+    for (let X=0; X<outW; X++){
+      const wq = G*X + yBase;
+      let sx = (A*X + B*Y + C)/wq;
+      let sy = (D*X + E*Y + F)/wq;
+      const o = (rowOut + X) << 2;
+
+      if (sx < -0.5 || sy < -0.5 || sx > maxX+0.5 || sy > maxY+0.5){
+        od[o]=255; od[o+1]=255; od[o+2]=255; od[o+3]=255;
+        continue;
+      }
+      if (sx < 0) sx = 0; else if (sx > maxX) sx = maxX;
+      if (sy < 0) sy = 0; else if (sy > maxY) sy = maxY;
+
+      const x0 = sx|0, y0 = sy|0;
+      const fx = sx - x0, fy = sy - y0;
+      const x1 = x0 < maxX ? x0+1 : x0;
+      const y1 = y0 < maxY ? y0+1 : y0;
+
+      const i00 = (y0*sw + x0) << 2;
+      const i10 = (y0*sw + x1) << 2;
+      const i01 = (y1*sw + x0) << 2;
+      const i11 = (y1*sw + x1) << 2;
+
+      const w00 = (1-fx)*(1-fy), w10 = fx*(1-fy);
+      const w01 = (1-fx)*fy,      w11 = fx*fy;
+
+      od[o  ] = sd[i00  ]*w00 + sd[i10  ]*w10 + sd[i01  ]*w01 + sd[i11  ]*w11;
+      od[o+1] = sd[i00+1]*w00 + sd[i10+1]*w10 + sd[i01+1]*w01 + sd[i11+1]*w11;
+      od[o+2] = sd[i00+2]*w00 + sd[i10+2]*w10 + sd[i01+2]*w01 + sd[i11+2]*w11;
+      od[o+3] = 255;
+    }
+  }
+
+  const dst = document.createElement('canvas');
+  dst.width = outW; dst.height = outH;
+  dst.getContext('2d').putImageData(out, 0, 0);
+  return dst;
+}
+
+/* ============================ crop slot =============================== */
+function Slot(label){
+  const el = document.createElement('section');
+  el.innerHTML = `<h3>${label}</h3>
+    <div class="row">
+      <input type="file" accept="image/*">
+      <button class="alt rot"   type="button">Rotate</button>
+      <button class="alt auto"  type="button">Auto-detect</button>
+      <button class="alt reset" type="button">Reset</button>
+    </div>
+    <canvas class="crop"></canvas>
+    <p class="mut" style="font-size:12px;margin:6px 0 0">
+      Move or resize the <span style="color:#a855f7;font-weight:700">purple guide</span> so it covers the ID, then press <em>Auto-detect</em>. Fine-tune the
+      <span style="color:#2a6df4;font-weight:700">blue result</span> by dragging its corners.
+    </p>`;
+  $('slots').appendChild(el);
+
+  const cv  = el.querySelector('canvas');
+  const ctx = cv.getContext('2d');
+
+  const S = {img:null, draft:null, result:null, s:1, _dirty:true, _cache:null, _cacheQ:0};
+
+  const PURPLE = '#a855f7';
+  const BLUE   = '#2a6df4';
+
+  function defaultDraft(w, h){
+    const ar = 1.586;                        // ID-1 aspect
+    let dw = w * 0.65;
+    let dh = dw / ar;
+    if (dh > h * 0.65){ dh = h * 0.65; dw = dh * ar; }
+    const x = (w - dw)/2, y = (h - dh)/2;
+    return [
+      {x,        y       },
+      {x: x+dw,  y       },
+      {x: x+dw,  y: y+dh },
+      {x,        y: y+dh },
+    ];
+  }
+
+  function activeQuad(){ return S.result || S.draft; }
+
+  /* ------------------------------ drawing ----------------------------- */
+  function draw(){
+    S._dirty = true;
+    if (!S.img){
+      cv.width = 320; cv.height = 110;
+      ctx.fillStyle = '#999'; ctx.font = '14px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('No image yet', 160, 60);
+      ctx.textAlign = 'left';
+      return;
+    }
+    const dw = Math.min(S.img.width, 560);
+    const s  = dw / S.img.width;
+    S.s = s;
+    cv.width  = dw;
+    cv.height = Math.max(1, Math.round(S.img.height*s));
+    ctx.drawImage(S.img, 0, 0, cv.width, cv.height);
+
+    const q = activeQuad();
+    if (!q) return;
+    const isResult = !!S.result;
+    const col = isResult ? BLUE : PURPLE;
+
+    /* dim outside */
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, cv.width, cv.height);
+    ctx.moveTo(q[0].x*s, q[0].y*s);
+    for (let i=1;i<4;i++) ctx.lineTo(q[i].x*s, q[i].y*s);
+    ctx.closePath();
+    ctx.fillStyle = isResult ? 'rgba(0,0,0,.45)' : 'rgba(168,85,247,.15)';
+    ctx.fill('evenodd');
+    ctx.restore();
+
+    /* outline */
+    ctx.beginPath();
+    ctx.moveTo(q[0].x*s, q[0].y*s);
+    for (let i=1;i<4;i++) ctx.lineTo(q[i].x*s, q[i].y*s);
+    ctx.closePath();
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 2;
+    if (!isResult) ctx.setLineDash([8, 5]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    /* corner handles — shown on both, but for purple they resize rigidly */
+    for (let i=0;i<4;i++){
+      ctx.beginPath();
+      ctx.arc(q[i].x*s, q[i].y*s, 7, 0, Math.PI*2);
+      ctx.fillStyle = '#fff';
+      ctx.fill();
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+
+  /* ------------------------------ loading ----------------------------- */
+  function setImg(canvas){
+    S.img    = canvas;
+    S.draft  = defaultDraft(canvas.width, canvas.height);
+    S.result = null;
+    S._cache = null;
+    draw(); update();
+  }
+
+  el.querySelector('input').onchange = e => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const url = URL.createObjectURL(f);
+    const im = new Image();
+    im.onload = () => {
+      URL.revokeObjectURL(url);
+      setImg(toCanvas(im, MAX_DIM));
+    };
+    im.onerror = () => { URL.revokeObjectURL(url); alert('Could not load that image.'); };
+    im.src = url;
+  };
+
+  /* ------------------------------ rotate ------------------------------ */
+  el.querySelector('.rot').onclick = () => {
+    if (!S.img) return;
+    const src = S.img;
+    const c = document.createElement('canvas');
+    c.width = src.height; c.height = src.width;
+    const x = c.getContext('2d');
+    x.translate(c.width, 0);
+    x.rotate(Math.PI/2);
+    x.drawImage(src, 0, 0);
+
+    const H = src.height;
+    const map = p => ({x: H - p.y, y: p.x});
+    S.img    = c;
+    S.draft  = S.draft  ? S.draft.map(map)  : defaultDraft(c.width, c.height);
+    S.result = S.result ? S.result.map(map) : null;
+    S._cache = null;
+    draw(); update();
+  };
+
+  /* --------------------------- auto-detect ---------------------------- */
+  el.querySelector('.auto').onclick = () => {
+    if (!S.img) return;
+    const btn = el.querySelector('.auto');
+    btn.textContent = 'Detecting…';
+    btn.disabled = true;
+    setTimeout(() => {
+      let q = null;
+      try {
+        if (S.draft) q = snapQuadToEdges(S.img, S.draft);
+      } catch (err){ console.error(err); }
+      btn.textContent = 'Auto-detect';
+      btn.disabled = false;
+      if (!q){
+        alert('Could not find the card edges inside the purple guide.\nMove the guide a bit closer and try again, or drag the guide corners manually.');
+        return;
+      }
+      S.result = q;
+      S._cache = null;
+      draw(); update();
+    }, 20);
+  };
+
+  /* ------------------------------ reset ------------------------------- */
+  el.querySelector('.reset').onclick = () => {
+    if (!S.img) return;
+    S.draft  = defaultDraft(S.img.width, S.img.height);
+    S.result = null;
+    S._cache = null;
+    draw(); update();
+  };
+
+  /* --------------------------- interaction ---------------------------- */
+  const HIT = 20;
+
+  function toDisp(e){
+    const b = cv.getBoundingClientRect();
+    return {
+      x: (e.clientX - b.left) * (cv.width  / b.width),
+      y: (e.clientY - b.top ) * (cv.height / b.height)
+    };
+  }
+  function toImg(e){
+    const d = toDisp(e);
+    return {x: d.x / S.s, y: d.y / S.s};
+  }
+
+  let drag = null;
+
+  cv.addEventListener('pointerdown', e => {
+    if (!S.img) return;
+    const q = activeQuad();
+    if (!q) return;
+
+    const d = toDisp(e);
+    let hit = -1;
+    for (let i=0;i<4;i++){
+      const hx = q[i].x*S.s, hy = q[i].y*S.s;
+      if (Math.hypot(d.x-hx, d.y-hy) <= HIT){ hit = i; break; }
+    }
+    const p = toImg(e);
+
+    if (!S.result){
+      /* purple draft mode: interior = move, corner = rigid resize */
+      if (hit >= 0){
+        drag = { which:'draft', mode:'scale', idx:hit, orig:q.map(pt=>({...pt})) };
+      } else if (pointInQuad(p, q)){
+        drag = { which:'draft', mode:'move', start:p, orig:q.map(pt=>({...pt})) };
+      } else {
+        return;
+      }
+    } else {
+      /* blue result mode: full quad editing */
+      if (hit < 0 && !pointInQuad(p, q)) return;
+      drag = {
+        which:'result',
+        mode: hit >= 0 ? 'corner' : 'move',
+        idx: hit,
+        start: p,
+        orig: q.map(pt => ({...pt}))
+      };
+    }
+
+    QUALITY = CROP_DRAG;
+    cv.setPointerCapture(e.pointerId);
+    cv.style.cursor = 'grabbing';
+    e.preventDefault();
+  });
+
+  cv.addEventListener('pointermove', e => {
+    if (!S.img) return;
+    const q0 = activeQuad();
+
+    if (!drag){
+      if (!q0) return;
+      const d = toDisp(e);
+      let over = false;
+      for (let i=0;i<4;i++){
+        if (Math.hypot(d.x - q0[i].x*S.s, d.y - q0[i].y*S.s) <= HIT){ over = true; break; }
+      }
+      const cur = over ? 'grab'
+                 : (pointInQuad(toImg(e), q0) ? 'move' : 'default');
+      cv.style.cursor = cur;
+      return;
+    }
+
+    const p = toImg(e);
+    const W = S.img.width, H = S.img.height;
+
+    if (drag.which === 'draft'){
+      if (drag.mode === 'scale'){
+        /* opposite corner stays fixed; keep the shape a rigid rectangle */
+        const opp = drag.orig[(drag.idx + 2) % 4];
+        const nx  = clamp(p.x, 0, W);
+        const ny  = clamp(p.y, 0, H);
+        const x0 = Math.min(opp.x, nx), x1 = Math.max(opp.x, nx);
+        const y0 = Math.min(opp.y, ny), y1 = Math.max(opp.y, ny);
+        if (x1 - x0 < 30 || y1 - y0 < 20) return;
+        S.draft = [
+          {x:x0, y:y0}, {x:x1, y:y0}, {x:x1, y:y1}, {x:x0, y:y1}
+        ];
+      } else {
+        /* move as a whole */
+        let minx = Infinity, maxx = -Infinity, miny = Infinity, maxy = -Infinity;
+        for (const q of drag.orig){
+          if (q.x < minx) minx = q.x;
+          if (q.x > maxx) maxx = q.x;
+          if (q.y < miny) miny = q.y;
+          if (q.y > maxy) maxy = q.y;
+        }
+        const dx = clamp(p.x - drag.start.x, -minx, W - maxx);
+        const dy = clamp(p.y - drag.start.y, -miny, H - maxy);
+        S.draft = drag.orig.map(q => ({x: q.x+dx, y: q.y+dy}));
+      }
+    } else {
+      /* blue result mode */
+      if (drag.mode === 'corner'){
+        const cand = drag.orig.map(q => ({...q}));
+        cand[drag.idx] = {x: clamp(p.x, 0, W), y: clamp(p.y, 0, H)};
+        if (isConvexQuad(cand) && quadArea(cand) > W*H*0.002) S.result = cand;
+      } else {
+        let minx = Infinity, maxx = -Infinity, miny = Infinity, maxy = -Infinity;
+        for (const q of drag.orig){
+          if (q.x < minx) minx = q.x;
+          if (q.x > maxx) maxx = q.x;
+          if (q.y < miny) miny = q.y;
+          if (q.y > maxy) maxy = q.y;
+        }
+        const dx = clamp(p.x - drag.start.x, -minx, W - maxx);
+        const dy = clamp(p.y - drag.start.y, -miny, H - maxy);
+        S.result = drag.orig.map(q => ({x: q.x+dx, y: q.y+dy}));
+      }
+    }
+
+    draw(); update();
+    e.preventDefault();
+  });
+
+  function endDrag(){
+    if (!drag) return;
+    drag = null;
+    cv.style.cursor = 'grab';
+    QUALITY = CROP_MAX;
+    S._dirty = true;
+    update();
+  }
+  cv.addEventListener('pointerup', endDrag);
+  cv.addEventListener('pointercancel', endDrag);
+
+  /* ------------------------------ crop -------------------------------- */
+  S.crop = () => {
+    if (!S.img) return null;
+    const q = activeQuad();
+    if (!q) return null;
+    if (S._cache && !S._dirty && S._cacheQ === QUALITY) return S._cache;
+    const c = warpQuad(S.img, q, QUALITY);
+    if (!c) return S._cache;
+    S._cache  = c;
+    S._cacheQ = QUALITY;
+    S._dirty  = false;
+    return c;
+  };
+
+  draw();
+  slots.push(S);
+  return S;
+}
+
+Slot('Front');
+Slot('Back');
+
+/* ================= custom draggable watermark texts =================== */
+const customTexts = [];
+let wmId = 0;
+
+function seedCustomText(){
+  const items = layout();
+  let x, y;
+  if (items.length){ x = items[0].x + 5; y = items[0].y + 15; }
+  else { x = 80; y = 40; }
+  customTexts.push({
+    id: ++wmId,
+    text: ($('wmText').value || 'For verification only'),
+    x, y, rot: -45
+  });
+}
+
+function renderWmList(){
+  const list = $('wmList');
+  list.innerHTML = '';
+  customTexts.forEach(t => {
+    const row = document.createElement('div');
+    row.className = 'wmRow';
+
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.value = t.text;
+    inp.placeholder = 'Watermark text';
+    inp.oninput = () => { t.text = inp.value; update(); };
+
+    const sel = document.createElement('select');
+    [['-45','↗ BL→TR'],['45','↘ TL→BR'],['0','— flat']].forEach(([v,l])=>{
+      const o = document.createElement('option');
+      o.value = v; o.textContent = l;
+      sel.appendChild(o);
+    });
+    sel.value = String(t.rot);
+    sel.title = 'Rotation';
+    sel.onchange = () => { t.rot = parseFloat(sel.value); update(); };
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'alt';
+    del.textContent = '×';
+    del.title = 'Remove';
+    del.onclick = () => {
+      const i = customTexts.indexOf(t);
+      if (i >= 0) customTexts.splice(i, 1);
+      renderWmList();
+      update();
+    };
+
+    row.append(inp, sel, del);
+    list.appendChild(row);
+  });
+}
+
+$('addWm').onclick = () => {
+  const [pw, ph] = PAGE[$('page').value];
+  const n = customTexts.length;
+  customTexts.push({
+    id: ++wmId,
+    text: 'Watermark ' + (n + 1),
+    x: pw/2 + (n % 3) * 15,
+    y: ph/2 + Math.floor(n / 3) * 14,
+    rot: -45
+  });
+  renderWmList();
+  update();
+};
+
+/* ============================ page layout ============================= */
+function layout(){
+  const [pw,ph] = PAGE[$('page').value];
+  const g = parseFloat($('gap').value) || 0;
+  const dims = [];
+  for (const S of slots){
+    const c = S.crop();
+    if (!c) continue;
+    dims.push({c, h: CARD_W * c.height / c.width});
+  }
+  const totalH = dims.reduce((a,d)=>a+d.h, 0) + g*Math.max(0, dims.length-1);
+  const x = (pw - CARD_W)/2;
+  let y = (ph - totalH)/2;
+  const out = [];
+  for (const d of dims){
+    out.push({c:d.c, x, y, w:CARD_W, h:d.h});
+    y += d.h + g;
+  }
+  return out;
+}
+
+/* ================= watermark: per-card modes ========================== */
+function drawCardWatermark(x, it, k){
+  if (!$('wmOn').checked) return;
+  const pos = $('wmPos').value;
+  if (pos === 'custom') return;
+  const t = $('wmText').value;
+  if (!t) return;
+
+  const px = it.x*k, py = it.y*k, pw = it.w*k, ph = it.h*k;
+  const fs = pw * ($('wmSz').value/100);
+
+  x.save();
+  x.beginPath(); x.rect(px,py,pw,ph); x.clip();
+  x.globalAlpha = $('wmOp').value/100;
+  x.fillStyle = '#888'; x.strokeStyle = '#fff';
+  x.lineWidth = Math.max(1, fs/14);
+  x.font = `bold ${fs}px sans-serif`;
+  x.textBaseline = 'middle';
+  const put = (tx,ty,al) => { x.textAlign = al; x.strokeText(t,tx,ty); x.fillText(t,tx,ty); };
+
+  if (pos === 'tile'){
+    x.translate(px+pw/2, py+ph/2);
+    x.rotate(-Math.PI/6);
+    const sx = x.measureText(t).width + fs*1.5, sy = fs*3;
+    const n = Math.ceil((pw+ph)/Math.min(sx,sy)) + 2;
+    for (let j=-n;j<=n;j++)
+      for (let i=-n;i<=n;i++)
+        put(i*sx + (j%2 ? sx/2 : 0), j*sy, 'center');
+  } else if (pos === 'center'){
+    put(px+pw/2, py+ph/2, 'center');
+  } else if (pos === 'bl'){
+    put(px+fs*.4, py+ph-fs*.8, 'left');
+  } else if (pos === 'br'){
+    put(px+pw-fs*.4, py+ph-fs*.8, 'right');
+  } else if (pos === 'top'){
+    put(px+pw/2, py+fs*.9, 'center');
+  }
+  x.restore();
+}
+
+/* ================= watermark: custom draggable texts ================== */
+function drawCustomWatermark(x, k){
+  if (!$('wmOn').checked) return;
+  if ($('wmPos').value !== 'custom') return;
+  if (!customTexts.length) return;
+
+  const fs = CARD_W * ($('wmSz').value/100) * k;
+  x.save();
+  x.globalAlpha = $('wmOp').value/100;
+  x.fillStyle = '#888'; x.strokeStyle = '#fff';
+  x.lineWidth = Math.max(1, fs/14);
+  x.font = `bold ${fs}px sans-serif`;
+  x.textBaseline = 'middle';
+  x.textAlign = 'center';
+  for (const t of customTexts){
+    if (!t.text) continue;
+    x.save();
+    x.translate(t.x*k, t.y*k);
+    x.rotate(t.rot*Math.PI/180);
+    x.strokeText(t.text, 0, 0);
+    x.fillText(t.text, 0, 0);
+    x.restore();
+  }
+  x.restore();
+}
+
+/* =============================== preview ============================== */
+function render(){
+  const [pw,ph] = PAGE[$('page').value];
+  const p = $('prev');
+  const W = 630, k = W/pw, H = Math.round(ph*k);
+  if (p.width  !== W) p.width  = W;
+  if (p.height !== H) p.height = H;
+
+  const x = p.getContext('2d');
+  x.setTransform(1,0,0,1,0,0);
+  x.fillStyle = '#fff'; x.fillRect(0,0,W,H);
+
+  const items = layout();
+  for (const it of items){
+    x.drawImage(it.c, it.x*k, it.y*k, it.w*k, it.h*k);
+    drawCardWatermark(x, it, k);
+  }
+  drawCustomWatermark(x, k);
+}
+
+/* ================= drag custom texts on the preview =================== */
+const prev = $('prev');
+let wmDrag = null;
+
+function prevCoords(e){
+  const r = prev.getBoundingClientRect();
+  return {
+    cx: (e.clientX - r.left) * prev.width  / r.width,
+    cy: (e.clientY - r.top ) * prev.height / r.height
+  };
+}
+
+function hitTest(cx, cy){
+  if ($('wmPos').value !== 'custom') return null;
+  if (!$('wmOn').checked) return null;
+  if (!customTexts.length) return null;
+
+  const [pw] = PAGE[$('page').value];
+  const k  = prev.width/pw;
+  const fs = CARD_W * ($('wmSz').value/100) * k;
+
+  const x = prev.getContext('2d');
+  x.save();
+  x.font = `bold ${fs}px sans-serif`;
+  const hPad = fs*0.65;
+  for (let i=customTexts.length-1;i>=0;i--){
+    const t = customTexts[i];
+    if (!t.text) continue;
+    const w = x.measureText(t.text).width;
+    const rad = t.rot*Math.PI/180;
+    const dx = cx - t.x*k, dy = cy - t.y*k;
+    const cos = Math.cos(-rad), sin = Math.sin(-rad);
+    const lx = dx*cos - dy*sin, ly = dx*sin + dy*cos;
+    if (Math.abs(lx) <= w/2 + 8 && Math.abs(ly) <= hPad){
+      x.restore();
+      return t;
+    }
+  }
+  x.restore();
+  return null;
+}
+
+prev.addEventListener('pointerdown', e => {
+  if (e.button !== undefined && e.button !== 0) return;
+  const {cx,cy} = prevCoords(e);
+  const t = hitTest(cx,cy);
+  if (!t) return;
+  const [pw] = PAGE[$('page').value];
+  const k = prev.width/pw;
+  wmDrag = {t, offX: cx/k - t.x, offY: cy/k - t.y};
+  prev.setPointerCapture(e.pointerId);
+  prev.style.cursor = 'grabbing';
+  e.preventDefault();
+});
+
+prev.addEventListener('pointermove', e => {
+  if (wmDrag){
+    const {cx,cy} = prevCoords(e);
+    const [pw,ph] = PAGE[$('page').value];
+    const k = prev.width/pw;
+    wmDrag.t.x = clamp(cx/k - wmDrag.offX, -50, pw+50);
+    wmDrag.t.y = clamp(cy/k - wmDrag.offY, -50, ph+50);
+    render();
+    e.preventDefault();
+  } else {
+    const {cx,cy} = prevCoords(e);
+    prev.style.cursor = hitTest(cx,cy) ? 'grab' : 'default';
+  }
+});
+
+function endWmDrag(){
+  if (wmDrag){ wmDrag = null; prev.style.cursor = 'grab'; }
+}
+prev.addEventListener('pointerup', endWmDrag);
+prev.addEventListener('pointercancel', endWmDrag);
+prev.addEventListener('pointerleave', () => { if (!wmDrag) prev.style.cursor = 'default'; });
+
+/* ============================== controls ============================== */
+function syncGapMax(){
+  const [,ph] = PAGE[$('page').value];
+  const g = $('gap');
+  g.max = ph;
+  if (parseFloat(g.value) > ph) g.value = ph;
+  $('gapv').textContent = fmt(+g.value);
+}
+
+$('page').addEventListener('change', () => { syncGapMax(); update(); });
+$('gap').addEventListener('input', () => {
+  $('gapv').textContent = fmt(+$('gap').value);
+  update();
+});
+['wmOn','wmText','wmOp','wmSz'].forEach(id => {
+  $(id).addEventListener('input', update);
+  $(id).addEventListener('change', update);
+});
+$('wmPos').addEventListener('change', () => {
+  const isCustom = $('wmPos').value === 'custom';
+  $('customWrap').style.display  = isCustom ? '' : 'none';
+  $('wmTextWrap').style.display  = isCustom ? 'none' : '';
+  if (isCustom && customTexts.length === 0){
+    seedCustomText();
+    renderWmList();
+  }
+  update();
+});
+
+/* =============================== export =============================== */
+$('pdf').onclick = () => {
+  const items = layout();
+  if (!items.length){ alert('Add at least one image first.'); return; }
+
+  const [pw,ph] = PAGE[$('page').value];
+  let scale = 300/25.4;
+  const maxPx = 30e6;
+  if (pw*scale*ph*scale > maxPx) scale = Math.sqrt(maxPx/(pw*ph));
+
+  const cv = document.createElement('canvas');
+  cv.width  = Math.round(pw*scale);
+  cv.height = Math.round(ph*scale);
+  const x = cv.getContext('2d');
+  x.fillStyle = '#fff';
+  x.fillRect(0, 0, cv.width, cv.height);
+
+  for (const it of items){
+    x.drawImage(it.c, it.x*scale, it.y*scale, it.w*scale, it.h*scale);
+    drawCardWatermark(x, it, scale);
+  }
+  drawCustomWatermark(x, scale);
+
+  const doc = new window.jspdf.jsPDF({unit:'mm', format:$('page').value});
+  doc.addImage(cv.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, pw, ph);
+  doc.save('id-card.pdf');
+};
+
+/* ================================ init ================================ */
+syncGapMax();
+renderWmList();
+render();
+</script></body></html>
