@@ -2,9 +2,9 @@
 <html lang="en"><head><meta charset="utf-8"><title>ID Card to PDF</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <style>
-:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--bg:#f6f6f4;--card:#fff;--tx:#1d1d1b;--mut:#6b6b66;--ac:#2a6df4;--bd:#d9d9d4}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#17181a;--card:#222426;--tx:#eee;--mut:#9a9a95;--ac:#6b9bff;--bd:#3a3c3f}}
-:root[data-theme="dark"]{--bg:#17181a;--card:#222426;--tx:#eee;--mut:#9a9a95;--ac:#6b9bff;--bd:#3a3c3f}
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--bg:#f6f6f4;--card:#fff;--tx:#1d1d1b;--mut:#6b6b66;--ac:#2a6df4;--bd:#d9d9d4;--src:#0f766e;--srcBg:#e6f5f3}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#17181a;--card:#222426;--tx:#eee;--mut:#9a9a95;--ac:#6b9bff;--bd:#3a3c3f;--src:#5eead4;--srcBg:#0f2e2a}}
+:root[data-theme="dark"]{--bg:#17181a;--card:#222426;--tx:#eee;--mut:#9a9a95;--ac:#6b9bff;--bd:#3a3c3f;--src:#5eead4;--srcBg:#0f2e2a}
 html{scroll-padding-top:env(safe-area-inset-top,0px)}
 body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}
 main{max-width:1100px;margin:0 auto;padding:16px;display:grid;gap:16px;grid-template-columns:1fr}
@@ -14,6 +14,10 @@ h1{font-size:20px;margin:0 0 4px}h3{margin:0 0 8px;font-size:15px}
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
 button{background:var(--ac);color:#fff;border:0;border-radius:6px;padding:7px 12px;font:inherit;cursor:pointer}
 button.alt{background:transparent;color:var(--tx);border:1px solid var(--bd)}
+/* distinct source buttons */
+button.src{background:var(--srcBg);color:var(--src);border:1px solid var(--src);font-weight:600}
+button.src:hover{filter:brightness(.97)}
+button.src:active{filter:brightness(.92)}
 input[type=text],select{padding:6px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:var(--tx);font:inherit;max-width:100%}
 input[type=range]{width:100%;accent-color:var(--ac)}
 label{display:flex;flex-direction:column;gap:2px;font-size:13px;color:var(--mut);margin-bottom:8px}
@@ -23,9 +27,16 @@ canvas.crop{max-width:100%;height:auto;touch-action:none;border:1px dashed var(-
 .wmRow{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:6px;margin-bottom:6px;align-items:center}
 .wmRow input,.wmRow select{min-width:0;padding:5px 6px;font-size:13px}
 .wmRow button{padding:4px 9px;line-height:1;font-size:15px}
+.srcRow{
+  margin: 8px 0 12px;
+}
+.toolRow{
+  margin: 12px 0 8px;
+}
+.srcRow .sep, .toolRow .sep{flex:1;height:1px;background:var(--bd);margin:0 2px}
 </style></head><body><main>
 <div>
-<h1>ID card → PDF</h1>
+<h1>ID card to PDF</h1>
 <p class="mut">Everything runs in your browser — images are never uploaded. Place the purple guide over your ID, press Auto-detect to snap it, then fine-tune the blue result. Cards print at real ID‑1 size (85.6&nbsp;mm wide) and are centred on the page.</p>
 <div id="slots"></div>
 </div>
@@ -63,16 +74,14 @@ canvas.crop{max-width:100%;height:auto;touch-action:none;border:1px dashed var(-
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script>
 /* =====================================================================
-   ID card → PDF
+   ID card to PDF
    ---------------------------------------------------------------------
    Workflow:
-     load → purple rigid rectangle guide → user places it → Auto-detect
-          → blue result quad → user fine-tunes → perspective warp → PDF
+     load (gallery or camera) → purple rigid rectangle guide
+     → user places it → Auto-detect → blue result quad
+     → user fine-tunes → perspective warp → PDF
    Detection:
-     For each side of the purple rectangle, fire short perpendicular scan
-     lines (10% end-offsets to avoid corner/neighbour edges), find the
-     strongest gradient on each, fit a robust line, intersect adjacent
-     lines → new quad.
+     Signed ∇I · n, outside→inside scan, cross-side sign vote.
    ===================================================================== */
 
 const $ = id => document.getElementById(id);
@@ -212,22 +221,6 @@ function boxBlur(src, w, h, r){
   return out;
 }
 
-function sobelMag(g, w, h){
-  const m = new Float32Array(w*h);
-  for (let y=1;y<h-1;y++){
-    for (let x=1;x<w-1;x++){
-      const i = y*w+x;
-      const a=g[i-w-1], b=g[i-w], c=g[i-w+1];
-      const d=g[i-1],             e=g[i+1];
-      const f=g[i+w-1], gg=g[i+w], hh=g[i+w+1];
-      const gx = (c + 2*e + hh) - (a + 2*d + f);
-      const gy = (f + 2*gg + hh) - (a + 2*b + c);
-      m[i] = Math.sqrt(gx*gx + gy*gy);
-    }
-  }
-  return m;
-}
-
 /* ---------- line fitting ---------- */
 function fitLineTLS(pts){
   let mx=0, my=0;
@@ -294,11 +287,11 @@ function snapQuadToEdges(srcCanvas, draftQuad, opts){
     lower searchR to ~0.025 and raise minEdge to 5.
   */
   const samples   = opts.samples   || 32;
-  const skipFrac  = opts.skipFrac  || 0.10;   // 10% offset at each end
-  const searchR   = opts.searchR   || 0.025;  // half-length as frac of side
+  const skipFrac  = opts.skipFrac  || 0.10;
+  const searchR   = opts.searchR   || 0.025;
   const minPoints = opts.minPoints || 6;
   const maxDim    = opts.maxDim    || 1024;
-  const minEdge   = opts.minEdge   || 2.0;    // gradient floor per peak
+  const minEdge   = opts.minEdge   || 2.0;
 
   const W0 = srcCanvas.width, H0 = srcCanvas.height;
   const sc = Math.min(1, maxDim/Math.max(W0,H0));
@@ -315,13 +308,10 @@ function snapQuadToEdges(srcCanvas, draftQuad, opts){
   const gray = toGray(work);
   const blur = boxBlur(boxBlur(gray, W, H, 1), W, H, 1);
 
-  // Draft quad in working coords, ordered TL,TR,BR,BL.
-  // With this winding, n = (uy, -ux) points OUTWARD on every side.
   const quad = orderQuad(draftQuad.map(p => ({x: p.x*sc, y: p.y*sc})));
 
-  // sideSamples[s] = [{ plus:{x,y,score}|null, minus:{x,y,score}|null }, ...]
   const sideSamples = [];
-  const sideScore   = [];   // { plus:avg, minus:avg, nP, nM }
+  const sideScore   = [];
 
   for (let s = 0; s < 4; s++){
     const a = quad[s], b = quad[(s+1)%4];
@@ -330,7 +320,7 @@ function snapQuadToEdges(srcCanvas, draftQuad, opts){
     if (L < 20) return null;
 
     const ux = dx/L, uy = dy/L;
-    const nx = uy, ny = -ux;                // outward normal
+    const nx = uy, ny = -ux;
 
     const halfLen = Math.max(6, Math.min(60, L * searchR));
     const steps   = Math.max(12, Math.round(halfLen * 2));
@@ -343,7 +333,6 @@ function snapQuadToEdges(srcCanvas, draftQuad, opts){
       const cx = a.x + dx * t;
       const cy = a.y + dy * t;
 
-      // OUTSIDE → INSIDE: o runs from +halfLen down to −halfLen
       let bestP = null, bestM = null;
       for (let j = 0; j <= steps; j++){
         const o = halfLen - (j / steps) * (2 * halfLen);
@@ -351,11 +340,8 @@ function snapQuadToEdges(srcCanvas, draftQuad, opts){
         const iy = Math.round(cy + ny * o);
         if (ix < 1 || iy < 1 || ix >= W-1 || iy >= H-1) continue;
 
-        // central-difference gradient of the blurred grey image
         const gx = (blur[iy*W + ix + 1] - blur[iy*W + ix - 1]) * 0.5;
         const gy = (blur[(iy+1)*W + ix] - blur[(iy-1)*W + ix]) * 0.5;
-
-        // signed directional derivative along the OUTWARD normal
         const D = gx * nx + gy * ny;
 
         if (D > 0){
@@ -386,7 +372,6 @@ function snapQuadToEdges(srcCanvas, draftQuad, opts){
     });
   }
 
-  // ---- cross-side vote ----
   let votesPlus = 0, votesMinus = 0, marginPlus = 0, marginMinus = 0;
   for (const s of sideScore){
     if (!s.nP && !s.nM) continue;
@@ -401,7 +386,6 @@ function snapQuadToEdges(srcCanvas, draftQuad, opts){
   else if (votesMinus > votesPlus)  winSign = 'minus';
   else                              winSign = (marginPlus >= marginMinus) ? 'plus' : 'minus';
 
-  // ---- fit each side to the winning sign (with per-side fallback) ----
   const other = winSign === 'plus' ? 'minus' : 'plus';
   const lines = [];
   for (let s = 0; s < 4; s++){
@@ -418,7 +402,6 @@ function snapQuadToEdges(srcCanvas, draftQuad, opts){
     lines.push(line);
   }
 
-  // ---- intersect adjacent lines → corners ----
   const corners = [];
   for (let i = 0; i < 4; i++){
     const p = intersectLines(lines[(i+3)%4], lines[i]);
@@ -508,13 +491,23 @@ function warpQuad(srcCanvas, quad, maxDim){
 function Slot(label){
   const el = document.createElement('section');
   el.innerHTML = `<h3>${label}</h3>
-    <div class="row">
-      <input type="file" accept="image/*">
+
+    <p class="row-title">Upload a photo: </p>
+    <div class="row srcRow">
+      <input type="file" accept="image/*" class="fileGal" style="display:none">
+      <input type="file" accept="image/*" capture="environment" class="fileCam" style="display:none">
+      <button class="alt gal" type="button">Gallery</button>
+      <button class="alt cam" type="button">Camera</button>
+    </div>
+
+    <canvas class="crop"></canvas>
+
+    <div class="row toolRow">
       <button class="alt rot"   type="button">Rotate</button>
       <button class="alt auto"  type="button">Auto-detect</button>
       <button class="alt reset" type="button">Reset</button>
     </div>
-    <canvas class="crop"></canvas>
+    
     <p class="mut" style="font-size:12px;margin:6px 0 0">
       Move or resize the <span style="color:#a855f7;font-weight:700">purple guide</span> so it covers the ID, then press <em>Auto-detect</em>. Fine-tune the
       <span style="color:#2a6df4;font-weight:700">blue result</span> by dragging its corners.
@@ -530,7 +523,7 @@ function Slot(label){
   const BLUE   = '#2a6df4';
 
   function defaultDraft(w, h){
-    const ar = 1.586;                        // ID-1 aspect
+    const ar = 1.586;
     let dw = w * 0.65;
     let dh = dw / ar;
     if (dh > h * 0.65){ dh = h * 0.65; dw = dh * ar; }
@@ -567,7 +560,6 @@ function Slot(label){
     const isResult = !!S.result;
     const col = isResult ? BLUE : PURPLE;
 
-    /* dim outside */
     ctx.save();
     ctx.beginPath();
     ctx.rect(0, 0, cv.width, cv.height);
@@ -578,7 +570,6 @@ function Slot(label){
     ctx.fill('evenodd');
     ctx.restore();
 
-    /* outline */
     ctx.beginPath();
     ctx.moveTo(q[0].x*s, q[0].y*s);
     for (let i=1;i<4;i++) ctx.lineTo(q[i].x*s, q[i].y*s);
@@ -589,7 +580,6 @@ function Slot(label){
     ctx.stroke();
     ctx.setLineDash([]);
 
-    /* corner handles — shown on both, but for purple they resize rigidly */
     for (let i=0;i<4;i++){
       ctx.beginPath();
       ctx.arc(q[i].x*s, q[i].y*s, 7, 0, Math.PI*2);
@@ -610,8 +600,7 @@ function Slot(label){
     draw(); update();
   }
 
-  el.querySelector('input').onchange = e => {
-    const f = e.target.files && e.target.files[0];
+  function loadFile(f){
     if (!f) return;
     const url = URL.createObjectURL(f);
     const im = new Image();
@@ -621,7 +610,14 @@ function Slot(label){
     };
     im.onerror = () => { URL.revokeObjectURL(url); alert('Could not load that image.'); };
     im.src = url;
-  };
+  }
+
+  const fileGal = el.querySelector('.fileGal');
+  const fileCam = el.querySelector('.fileCam');
+  fileGal.onchange = e => { loadFile(e.target.files && e.target.files[0]); e.target.value = ''; };
+  fileCam.onchange = e => { loadFile(e.target.files && e.target.files[0]); e.target.value = ''; };
+  el.querySelector('.gal').onclick = () => fileGal.click();
+  el.querySelector('.cam').onclick = () => fileCam.click();
 
   /* ------------------------------ rotate ------------------------------ */
   el.querySelector('.rot').onclick = () => {
@@ -706,7 +702,6 @@ function Slot(label){
     const p = toImg(e);
 
     if (!S.result){
-      /* purple draft mode: interior = move, corner = rigid resize */
       if (hit >= 0){
         drag = { which:'draft', mode:'scale', idx:hit, orig:q.map(pt=>({...pt})) };
       } else if (pointInQuad(p, q)){
@@ -715,7 +710,6 @@ function Slot(label){
         return;
       }
     } else {
-      /* blue result mode: full quad editing */
       if (hit < 0 && !pointInQuad(p, q)) return;
       drag = {
         which:'result',
@@ -754,7 +748,6 @@ function Slot(label){
 
     if (drag.which === 'draft'){
       if (drag.mode === 'scale'){
-        /* opposite corner stays fixed; keep the shape a rigid rectangle */
         const opp = drag.orig[(drag.idx + 2) % 4];
         const nx  = clamp(p.x, 0, W);
         const ny  = clamp(p.y, 0, H);
@@ -765,7 +758,6 @@ function Slot(label){
           {x:x0, y:y0}, {x:x1, y:y0}, {x:x1, y:y1}, {x:x0, y:y1}
         ];
       } else {
-        /* move as a whole */
         let minx = Infinity, maxx = -Infinity, miny = Infinity, maxy = -Infinity;
         for (const q of drag.orig){
           if (q.x < minx) minx = q.x;
@@ -778,7 +770,6 @@ function Slot(label){
         S.draft = drag.orig.map(q => ({x: q.x+dx, y: q.y+dy}));
       }
     } else {
-      /* blue result mode */
       if (drag.mode === 'corner'){
         const cand = drag.orig.map(q => ({...q}));
         cand[drag.idx] = {x: clamp(p.x, 0, W), y: clamp(p.y, 0, H)};
